@@ -13,6 +13,7 @@ including other versions of pandas.
 
 Fixed regressions
 ~~~~~~~~~~~~~~~~~
+- Fixed regression in :meth:`Series.mean`, :meth:`DataFrame.mean` and :meth:`.DataFrameGroupBy.mean` raising ``TypeError`` for object-dtype data whose elements are ``numpy.ndarray`` objects of integer, float or object dtype holding numbers (optionally mixed with numeric scalars such as :class:`fractions.Fraction`, or missing values), instead of averaging them elementwise; integer and boolean elements are now summed exactly in ``int64`` (``float64`` if that could overflow) rather than wrapping around (:issue:`34671`)
 
 
 .. ---------------------------------------------------------------------------

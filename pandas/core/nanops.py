@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import functools
 import itertools
+import numbers
 from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
+    NoReturn,
     cast,
 )
 import warnings
@@ -654,6 +656,132 @@ def _ensure_numeric_input(func: F) -> F:
     return cast("F", new_func)
 
 
+def _raise_not_numeric(val: object) -> NoReturn:
+    """
+    Raise TypeError naming the element that stopped `_numeric_ndarray_elements`.
+    """
+    desc = repr(val)
+    if "\n" in desc:
+        # keep the message on one line; a Series/DataFrame repr does not
+        #  name its type, so add it
+        desc = " ".join(desc.split())
+        if not isinstance(val, np.ndarray):
+            desc = f"{type(val).__name__} {desc}"
+    raise TypeError(f"Could not convert {desc} to numeric")
+
+
+def _numeric_ndarray_elements(values: np.ndarray) -> np.ndarray | None:
+    """
+    Normalize object-dtype `values` whose elements are numeric ndarrays.
+
+    Only what elementwise ``+`` would get wrong is converted: NAs become NaN,
+    object-dtype ndarrays their numeric equivalent, float16 float64, other
+    real numbers such as Fraction float, and bool/integer ndarrays and numpy
+    scalars int64/int, or float64/float if their sum could overflow int64.
+    Everything else, e.g. float32, int64 and complex ndarrays or Python int
+    and float scalars, is passed through as is.
+
+    Parameters
+    ----------
+    values : np.ndarray
+
+    Returns
+    -------
+    np.ndarray or None
+        The normalized values if each element is a numeric ndarray, a real or
+        complex number or an NA; None if no element is an ndarray.
+
+    Raises
+    ------
+    TypeError
+        If an element is an ndarray but some element is neither of the above.
+    """
+    if values.dtype != object or not any(
+        isinstance(val, np.ndarray) for val in values.ravel()
+    ):
+        return None
+    result = np.empty(values.size, dtype=object)
+    int_positions = []
+    # bounds the magnitude of every partial sum of the integer elements
+    int_bound = 0
+    for i, val in enumerate(values.ravel()):
+        if isinstance(val, np.ndarray):
+            if val.dtype == object:
+                # held to the same rules as an object column, so numbers pass
+                #  (NAs becoming NaN) and e.g. strings raise naming the culprit
+                val = _ensure_numeric(val)
+            elif val.dtype == np.float16:
+                # GH#43929 float16 sums overflow; upcast as a float16 column does
+                val = val.astype(np.float64)
+            elif val.dtype.kind not in "biufc":
+                _raise_not_numeric(val)
+            if val.dtype.kind in "biu":
+                int_positions.append(i)
+                if val.size:
+                    int_bound += max(int(val.max()), -int(val.min()))
+        elif lib.is_scalar(val) and isna(val):
+            # None/pd.NA/NaT have no arithmetic with an ndarray; NaN does, so
+            #  skipna=False propagates it instead of raising
+            val = np.nan
+        elif lib.is_bool(val) or lib.is_integer(val):
+            int_positions.append(i)
+            int_bound += abs(int(val))
+        elif isinstance(val, np.float16):
+            # scalars ahead of every ndarray are added to each other first
+            val = np.float64(val)
+        elif lib.is_float(val) or lib.is_complex(val):
+            pass
+        elif isinstance(val, numbers.Real):
+            # e.g. Fraction, which an ndarray would otherwise turn into an
+            #  object ndarray of Fractions
+            val = float(val)
+        else:
+            # name the culprit, not whichever ndarray the numeric cast choked
+            #  on first; e.g. Decimal, which does not mix with float
+            _raise_not_numeric(val)
+        result[i] = val
+
+    # Elementwise bool addition is logical or and narrow integers wrap around,
+    #  so sum integers as int64, keeping them exact.  Should that overflow,
+    #  fall back to float64, which is how an integer column is summed anyway.
+    exact = int_bound < 2**63
+    for i in int_positions:
+        val = result[i]
+        if isinstance(val, np.ndarray):
+            result[i] = val.astype(np.int64 if exact else np.float64, copy=False)
+        elif not exact:
+            result[i] = float(val)
+        elif isinstance(val, (np.integer, np.bool_)):
+            # the same holds for numpy scalars added before any ndarray
+            result[i] = int(val)
+    return result.reshape(values.shape)
+
+
+def _ensure_numeric_or_ndarrays_input(func: F) -> F:
+    """
+    Like `_ensure_numeric_input`, but let through object values holding ndarrays.
+
+    A column whose elements are numeric ndarrays (possibly mixed with numeric
+    scalars) has always been reduced elementwise by object-dtype arithmetic,
+    broadcasting as numpy does; anything else that fails to convert still
+    raises.
+    """
+
+    @functools.wraps(func)
+    def new_func(values: np.ndarray, **kwargs):
+        try:
+            values = _ensure_numeric(values)
+        except TypeError:
+            # only checked on failure, so numeric input pays nothing for it
+            ndarray_values = _numeric_ndarray_elements(values)
+            if ndarray_values is None:
+                raise
+            values = ndarray_values
+        return func(values, **kwargs)
+
+    return cast("F", new_func)
+
+
 def dt64_any_all_msg(how: str) -> str:
     """
     Message for the GH#34479 removal of any/all on datetime64 data.
@@ -955,7 +1083,7 @@ def _mask_datetimelike_result(
     return result
 
 
-@_ensure_numeric_input
+@_ensure_numeric_or_ndarrays_input
 @bottleneck_switch()
 @_datetimelike_compat
 def nanmean(
